@@ -18,12 +18,6 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/xray"
 )
 
-// IPWithTimestamp tracks an IP address with its last seen timestamp
-type IPWithTimestamp struct {
-	IP        string `json:"ip"`
-	Timestamp int64  `json:"timestamp"`
-}
-
 // CheckClientIpJob monitors client IP addresses from access logs and manages IP blocking based on configured limits.
 type CheckClientIpJob struct {
 	lastClear     int64
@@ -125,14 +119,12 @@ func (j *CheckClientIpJob) processLogFile() bool {
 
 	ipRegex := regexp.MustCompile(`from (?:tcp:|udp:)?\[?([0-9a-fA-F\.:]+)\]?:\d+ accepted`)
 	emailRegex := regexp.MustCompile(`email: (.+)$`)
-	timestampRegex := regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})`)
 
 	accessLogPath, _ := xray.GetAccessLogPath()
 	file, _ := os.Open(accessLogPath)
 	defer file.Close()
 
-	// Track IPs with their last seen timestamp
-	inboundClientIps := make(map[string]map[string]int64, 100)
+	inboundClientIps := make(map[string]map[string]struct{}, 100)
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -155,45 +147,28 @@ func (j *CheckClientIpJob) processLogFile() bool {
 		}
 		email := emailMatches[1]
 
-		// Extract timestamp from log line
-		var timestamp int64
-		timestampMatches := timestampRegex.FindStringSubmatch(line)
-		if len(timestampMatches) >= 2 {
-			t, err := time.Parse("2006/01/02 15:04:05", timestampMatches[1])
-			if err == nil {
-				timestamp = t.Unix()
-			} else {
-				timestamp = time.Now().Unix()
-			}
-		} else {
-			timestamp = time.Now().Unix()
-		}
-
 		if _, exists := inboundClientIps[email]; !exists {
-			inboundClientIps[email] = make(map[string]int64)
+			inboundClientIps[email] = make(map[string]struct{})
 		}
-		// Update timestamp - keep the latest
-		if existingTime, ok := inboundClientIps[email][ip]; !ok || timestamp > existingTime {
-			inboundClientIps[email][ip] = timestamp
-		}
+		inboundClientIps[email][ip] = struct{}{}
 	}
 
 	shouldCleanLog := false
-	for email, ipTimestamps := range inboundClientIps {
+	for email, uniqueIps := range inboundClientIps {
 
-		// Convert to IPWithTimestamp slice
-		ipsWithTime := make([]IPWithTimestamp, 0, len(ipTimestamps))
-		for ip, timestamp := range ipTimestamps {
-			ipsWithTime = append(ipsWithTime, IPWithTimestamp{IP: ip, Timestamp: timestamp})
+		ips := make([]string, 0, len(uniqueIps))
+		for ip := range uniqueIps {
+			ips = append(ips, ip)
 		}
+		sort.Strings(ips)
 
 		clientIpsRecord, err := j.getInboundClientIps(email)
 		if err != nil {
-			j.addInboundClientIps(email, ipsWithTime)
+			j.addInboundClientIps(email, ips)
 			continue
 		}
 
-		shouldCleanLog = j.updateInboundClientIps(clientIpsRecord, email, ipsWithTime) || shouldCleanLog
+		shouldCleanLog = j.updateInboundClientIps(clientIpsRecord, email, ips) || shouldCleanLog
 	}
 
 	return shouldCleanLog
@@ -238,9 +213,9 @@ func (j *CheckClientIpJob) getInboundClientIps(clientEmail string) (*model.Inbou
 	return InboundClientIps, nil
 }
 
-func (j *CheckClientIpJob) addInboundClientIps(clientEmail string, ipsWithTime []IPWithTimestamp) error {
+func (j *CheckClientIpJob) addInboundClientIps(clientEmail string, ips []string) error {
 	inboundClientIps := &model.InboundClientIps{}
-	jsonIps, err := json.Marshal(ipsWithTime)
+	jsonIps, err := json.Marshal(ips)
 	j.checkError(err)
 
 	inboundClientIps.ClientEmail = clientEmail
@@ -264,8 +239,16 @@ func (j *CheckClientIpJob) addInboundClientIps(clientEmail string, ipsWithTime [
 	return nil
 }
 
-func (j *CheckClientIpJob) updateInboundClientIps(inboundClientIps *model.InboundClientIps, clientEmail string, newIpsWithTime []IPWithTimestamp) bool {
-	// Get the inbound configuration
+func (j *CheckClientIpJob) updateInboundClientIps(inboundClientIps *model.InboundClientIps, clientEmail string, ips []string) bool {
+	jsonIps, err := json.Marshal(ips)
+	if err != nil {
+		logger.Error("failed to marshal IPs to JSON:", err)
+		return false
+	}
+
+	inboundClientIps.ClientEmail = clientEmail
+	inboundClientIps.Ips = string(jsonIps)
+
 	inbound, err := j.getInboundByEmail(clientEmail)
 	if err != nil {
 		logger.Errorf("failed to fetch inbound settings for email %s: %s", clientEmail, err)
@@ -280,58 +263,9 @@ func (j *CheckClientIpJob) updateInboundClientIps(inboundClientIps *model.Inboun
 	settings := map[string][]model.Client{}
 	json.Unmarshal([]byte(inbound.Settings), &settings)
 	clients := settings["clients"]
-
-	// Find the client's IP limit
-	var limitIp int
-	var clientFound bool
-	for _, client := range clients {
-		if client.Email == clientEmail {
-			limitIp = client.LimitIP
-			clientFound = true
-			break
-		}
-	}
-
-	if !clientFound || limitIp <= 0 || !inbound.Enable {
-		// No limit or inbound disabled, just update and return
-		jsonIps, _ := json.Marshal(newIpsWithTime)
-		inboundClientIps.Ips = string(jsonIps)
-		db := database.GetDB()
-		db.Save(inboundClientIps)
-		return false
-	}
-
-	// Parse old IPs from database
-	var oldIpsWithTime []IPWithTimestamp
-	if inboundClientIps.Ips != "" {
-		json.Unmarshal([]byte(inboundClientIps.Ips), &oldIpsWithTime)
-	}
-
-	// Merge old and new IPs, keeping the latest timestamp for each IP
-	ipMap := make(map[string]int64)
-	for _, ipTime := range oldIpsWithTime {
-		ipMap[ipTime.IP] = ipTime.Timestamp
-	}
-	for _, ipTime := range newIpsWithTime {
-		if existingTime, ok := ipMap[ipTime.IP]; !ok || ipTime.Timestamp > existingTime {
-			ipMap[ipTime.IP] = ipTime.Timestamp
-		}
-	}
-
-	// Convert back to slice and sort by timestamp (oldest first)
-	// This ensures we always protect the original/current connections and ban new excess ones.
-	allIps := make([]IPWithTimestamp, 0, len(ipMap))
-	for ip, timestamp := range ipMap {
-		allIps = append(allIps, IPWithTimestamp{IP: ip, Timestamp: timestamp})
-	}
-	sort.Slice(allIps, func(i, j int) bool {
-		return allIps[i].Timestamp < allIps[j].Timestamp // Ascending order (oldest first)
-	})
-
 	shouldCleanLog := false
 	j.disAllowedIps = []string{}
 
-	// Open log file
 	logIpFile, err := os.OpenFile(xray.GetIPLimitLogPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		logger.Errorf("failed to open IP limit log file: %s", err)
@@ -341,27 +275,27 @@ func (j *CheckClientIpJob) updateInboundClientIps(inboundClientIps *model.Inboun
 	log.SetOutput(logIpFile)
 	log.SetFlags(log.LstdFlags)
 
-	// Check if we exceed the limit
-	if len(allIps) > limitIp {
-		shouldCleanLog = true
+	for _, client := range clients {
+		if client.Email == clientEmail {
+			limitIp := client.LimitIP
 
-		// Keep the oldest IPs (currently active connections) and ban the new excess ones.
-		keptIps := allIps[:limitIp]
-		bannedIps := allIps[limitIp:]
+			if limitIp > 0 && inbound.Enable {
+				shouldCleanLog = true
 
-		// Log banned IPs in the format fail2ban filters expect: [LIMIT_IP] Email = X || Disconnecting OLD IP = Y || Timestamp = Z
-		for _, ipTime := range bannedIps {
-			j.disAllowedIps = append(j.disAllowedIps, ipTime.IP)
-			log.Printf("[LIMIT_IP] Email = %s || Disconnecting OLD IP = %s || Timestamp = %d", clientEmail, ipTime.IP, ipTime.Timestamp)
+				if limitIp < len(ips) {
+					j.disAllowedIps = append(j.disAllowedIps, ips[limitIp:]...)
+					for i := limitIp; i < len(ips); i++ {
+						log.Printf("[LIMIT_IP] Email = %s || SRC = %s", clientEmail, ips[i])
+					}
+				}
+			}
 		}
+	}
 
-		// Update database with only the currently active (kept) IPs
-		jsonIps, _ := json.Marshal(keptIps)
-		inboundClientIps.Ips = string(jsonIps)
-	} else {
-		// Under limit, save all IPs
-		jsonIps, _ := json.Marshal(allIps)
-		inboundClientIps.Ips = string(jsonIps)
+	sort.Strings(j.disAllowedIps)
+
+	if len(j.disAllowedIps) > 0 {
+		logger.Debug("disAllowedIps:", j.disAllowedIps)
 	}
 
 	db := database.GetDB()
@@ -369,10 +303,6 @@ func (j *CheckClientIpJob) updateInboundClientIps(inboundClientIps *model.Inboun
 	if err != nil {
 		logger.Error("failed to save inboundClientIps:", err)
 		return false
-	}
-
-	if len(j.disAllowedIps) > 0 {
-		logger.Infof("[LIMIT_IP] Client %s: Kept %d current IPs, queued %d new IPs for fail2ban", clientEmail, limitIp, len(j.disAllowedIps))
 	}
 
 	return shouldCleanLog
