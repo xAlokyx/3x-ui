@@ -519,7 +519,7 @@ func (s *ServerService) sampleCPUUtilization() (float64, error) {
 
 func (s *ServerService) GetXrayVersions() ([]string, error) {
 	const (
-		XrayURL    = "https://api.github.com/repos/XTLS/Xray-core/releases"
+		XrayURL    = "https://api.github.com/repos/xAlokyx/Xray-core/releases"
 		bufferSize = 8192
 	)
 
@@ -621,7 +621,7 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	}
 
 	fileName := fmt.Sprintf("Xray-%s-%s.zip", osName, arch)
-	url := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/download/%s/%s", version, fileName)
+	url := fmt.Sprintf("https://github.com/xAlokyx/Xray-core/releases/download/%s/%s", version, fileName)
 	resp, err := http.Get(url)
 	if err != nil {
 		return "", err
