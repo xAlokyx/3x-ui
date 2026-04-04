@@ -890,17 +890,17 @@
       },
       updateObservatorySelectors() {
         newTemplateSettings = this.templateSettings;
-        const leastPings = this.balancersData.filter((b) => b.strategy == 'leastPing');
+        const pingBasedBalancers = this.balancersData.filter((b) => b.strategy == 'leastPing' || b.strategy == 'highestPing');
         const leastLoads = this.balancersData.filter((b) =>
           b.strategy === 'leastLoad' ||
           b.strategy === 'roundRobin' ||
           b.strategy === 'random'
         );
-        if (leastPings.length > 0) {
+        if (pingBasedBalancers.length > 0) {
           if (!newTemplateSettings.observatory)
             newTemplateSettings.observatory = this.defaultObservatory;
           newTemplateSettings.observatory.subjectSelector = [];
-          leastPings.forEach((b) => {
+          pingBasedBalancers.forEach((b) => {
             b.selector.forEach((s) => {
               if (!newTemplateSettings.observatory.subjectSelector.includes(s))
                 newTemplateSettings.observatory.subjectSelector.push(s);
