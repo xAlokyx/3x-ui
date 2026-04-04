@@ -520,7 +520,9 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 	}
 	s.xrayApi.Close()
 
-	// Propagate the new speed limits to tc (must happen after the save so the ID is stable).
+	// Propagate the new speed limits to tc after a successful save.
+	// Speed limits are applied after tx.Save so that a rollback does not leave
+	// stale tc rules pointing at settings that were never persisted.
 	oldInbound.SpeedLimitDown = inbound.SpeedLimitDown
 	oldInbound.SpeedLimitUp = inbound.SpeedLimitUp
 	saveErr := tx.Save(oldInbound).Error

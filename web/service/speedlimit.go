@@ -16,12 +16,27 @@ const (
 	tcRootClass    = "1:1"
 	tcDefaultClass = "1:65535"
 	tcDefaultPrio  = "65535"
+	// tcClassOffset is added to the inbound ID to derive the HTB class minor number.
+	// This avoids collision with the reserved default class (65535) and the root class (1).
+	// Inbound IDs start at 1; with an offset of 100 they map to 101-65434 (well within range).
+	tcClassOffset = 100
+	// tcMinBurstKB is the minimum burst size in KB for tc rate-limit rules.
+	tcMinBurstKB = 32
 )
 
 // SpeedLimitService manages per-inbound bandwidth limiting using Linux tc (traffic control).
 // Download limits are enforced via HTB egress classes; upload limits via ingress police filters.
+// NOTE: Only IPv4 traffic is rate-limited. IPv6 connections bypass these limits.
+// NOTE: tc is only available on Linux. On other platforms all methods are no-ops.
 // The service is stateless – all state lives in the kernel's tc tables.
 type SpeedLimitService struct{}
+
+// tcAvailable reports whether the tc binary is accessible.
+// It is checked lazily on first use; failures are logged as warnings.
+func tcAvailable() bool {
+	_, err := exec.LookPath("tc")
+	return err == nil
+}
 
 // getDefaultInterface returns the name of the primary network interface used for the default route.
 func (s *SpeedLimitService) getDefaultInterface() (string, error) {
@@ -75,15 +90,16 @@ func (s *SpeedLimitService) ensureIngress(iface string) {
 	runTC("qdisc", "add", "dev", iface, "handle", "ffff:", "ingress")
 }
 
-// classID returns the HTB class identifier string for the given inbound.
-func classID(inbound *model.Inbound) string {
-	return fmt.Sprintf("1:%d", inbound.Id)
+// tcHandle returns the HTB class handle string for the given inbound (e.g. "1:101").
+// The offset prevents collisions with reserved class IDs (1 and 65535).
+func tcHandle(inbound *model.Inbound) string {
+	return fmt.Sprintf("1:%d", inbound.Id+tcClassOffset)
 }
 
-// prioStr returns the tc filter priority string for the given inbound.
-// Using the inbound ID keeps it unique and stable across service restarts.
-func prioStr(inbound *model.Inbound) string {
-	return fmt.Sprintf("%d", inbound.Id)
+// tcPrio returns the tc filter priority string for the given inbound.
+// The offset keeps priorities in a distinct range from reserved values.
+func tcPrio(inbound *model.Inbound) string {
+	return fmt.Sprintf("%d", inbound.Id+tcClassOffset)
 }
 
 // kbitRate converts a KB/s value to a kbit/s string suitable for tc rate arguments.
@@ -92,19 +108,28 @@ func kbitRate(kbps int64) string {
 }
 
 // burstValue returns a sensible burst size string for the given KB/s rate.
+// A minimum of tcMinBurstKB is enforced to avoid excessive drops on bursty traffic.
 func burstValue(kbps int64) string {
 	burst := kbps / 8
-	if burst < 1 {
-		burst = 1
+	if burst < tcMinBurstKB {
+		burst = tcMinBurstKB
 	}
 	return fmt.Sprintf("%dk", burst)
 }
 
 // ApplySpeedLimit configures tc rules to enforce download/upload limits for the inbound.
 // Calling with SpeedLimitDown == 0 && SpeedLimitUp == 0 removes any existing rules.
+// Returns an error if tc is unavailable or the default interface cannot be determined;
+// individual tc sub-commands that fail are only logged (not returned) to keep the
+// inbound operation from failing.
 func (s *SpeedLimitService) ApplySpeedLimit(inbound *model.Inbound) error {
 	if inbound.SpeedLimitDown == 0 && inbound.SpeedLimitUp == 0 {
 		s.RemoveSpeedLimit(inbound)
+		return nil
+	}
+
+	if !tcAvailable() {
+		logger.Warning("speed limit: 'tc' binary not found; speed limits will not be enforced")
 		return nil
 	}
 
@@ -117,30 +142,33 @@ func (s *SpeedLimitService) ApplySpeedLimit(inbound *model.Inbound) error {
 	s.RemoveSpeedLimit(inbound)
 
 	port := fmt.Sprintf("%d", inbound.Port)
-	prio := prioStr(inbound)
+	handle := tcHandle(inbound)
+	prio := tcPrio(inbound)
 
 	if inbound.SpeedLimitDown > 0 {
 		// Egress: limit traffic leaving the server (= client download).
+		// Note: only IPv4 traffic is matched; IPv6 is not rate-limited.
 		s.ensureHTBRoot(iface)
 
 		rate := kbitRate(inbound.SpeedLimitDown)
 		burst := burstValue(inbound.SpeedLimitDown)
 
 		if err := runTC("class", "add", "dev", iface, "parent", tcRootClass,
-			"classid", classID(inbound), "htb", "rate", rate, "burst", burst); err != nil {
+			"classid", handle, "htb", "rate", rate, "burst", burst); err != nil {
 			logger.Warningf("speed limit: failed to add egress class for inbound %d: %v", inbound.Id, err)
 		}
 
 		if err := runTC("filter", "add", "dev", iface, "parent", tcRootHandle,
 			"protocol", "ip", "prio", prio,
 			"u32", "match", "ip", "sport", port, "0xffff",
-			"flowid", classID(inbound)); err != nil {
+			"flowid", handle); err != nil {
 			logger.Warningf("speed limit: failed to add egress filter for inbound %d: %v", inbound.Id, err)
 		}
 	}
 
 	if inbound.SpeedLimitUp > 0 {
 		// Ingress: police traffic arriving at the server (= client upload).
+		// Note: only IPv4 traffic is matched; IPv6 is not rate-limited.
 		s.ensureIngress(iface)
 
 		rate := kbitRate(inbound.SpeedLimitUp)
@@ -159,17 +187,21 @@ func (s *SpeedLimitService) ApplySpeedLimit(inbound *model.Inbound) error {
 
 // RemoveSpeedLimit deletes any tc rules previously applied for the inbound.
 func (s *SpeedLimitService) RemoveSpeedLimit(inbound *model.Inbound) {
+	if !tcAvailable() {
+		return
+	}
+
 	iface, err := s.getDefaultInterface()
 	if err != nil {
 		logger.Debugf("speed limit cleanup: %v", err)
 		return
 	}
 
-	prio := prioStr(inbound)
+	prio := tcPrio(inbound)
 
 	// Delete egress filter and class (errors are expected when rules don't exist).
 	runTC("filter", "del", "dev", iface, "parent", tcRootHandle, "prio", prio)
-	runTC("class", "del", "dev", iface, "classid", classID(inbound))
+	runTC("class", "del", "dev", iface, "classid", tcHandle(inbound))
 
 	// Delete ingress filter.
 	runTC("filter", "del", "dev", iface, "parent", "ffff:", "prio", prio)
@@ -178,6 +210,10 @@ func (s *SpeedLimitService) RemoveSpeedLimit(inbound *model.Inbound) {
 // RestoreAllLimits re-applies tc rules for every enabled inbound that has a speed limit set.
 // This should be called once on server startup since tc rules do not survive reboots.
 func (s *SpeedLimitService) RestoreAllLimits(inbounds []*model.Inbound) {
+	if !tcAvailable() {
+		logger.Warning("speed limit: 'tc' binary not found; per-inbound speed limits are disabled")
+		return
+	}
 	for _, inbound := range inbounds {
 		if !inbound.Enable {
 			continue
