@@ -591,6 +591,16 @@ class SizeFormatter {
         if (size < this.ONE_PB) return (size / this.ONE_TB).toFixed(2) + " TB";
         return (size / this.ONE_PB).toFixed(2) + " PB";
     }
+
+    static bitFormat(size) {
+        const bits = size * 8;
+        if (bits <= 0) return "0 b";
+        if (bits < 1000) return bits.toFixed(0) + " b";
+        if (bits < 1000000) return (bits / 1000).toFixed(2) + " Kb";
+        if (bits < 1000000000) return (bits / 1000000).toFixed(2) + " Mb";
+        if (bits < 1000000000000) return (bits / 1000000000).toFixed(2) + " Gb";
+        return (bits / 1000000000000).toFixed(2) + " Tb";
+    }
 }
 
 class CPUFormatter {
