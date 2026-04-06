@@ -205,7 +205,7 @@
                   <a-row :gutter="isMobile ? [8,8] : 0">
                     <a-col :span="12">
                       <a-custom-statistic title='{{ i18n "pages.index.upload" }}'
-                        :value="SizeFormatter.sizeFormat(status.netIO.up)">
+                        :value="SizeFormatter.bitFormat(status.netIO.up)">
                         <template #prefix>
                           <a-icon type="arrow-up" />
                         </template>
@@ -216,7 +216,7 @@
                     </a-col>
                     <a-col :span="12">
                       <a-custom-statistic title='{{ i18n "pages.index.download" }}'
-                        :value="SizeFormatter.sizeFormat(status.netIO.down)">
+                        :value="SizeFormatter.bitFormat(status.netIO.down)">
                         <template #prefix>
                           <a-icon type="arrow-down" />
                         </template>
