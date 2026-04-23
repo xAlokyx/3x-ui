@@ -4,6 +4,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -2800,4 +2801,53 @@ func (s *InboundService) DelInboundClientByEmail(inboundId int, email string) (b
 	}
 
 	return needRestart, db.Save(oldInbound).Error
+}
+
+// CycleClientSessions temporarily removes and re-adds a client through Xray gRPC
+// to drop existing streams and force a clean reconnect.
+func (s *InboundService) CycleClientSessions(inbound *model.Inbound, client model.Client) error {
+	if inbound == nil {
+		return errors.New("inbound is nil")
+	}
+	if client.Email == "" {
+		return errors.New("client email is empty")
+	}
+	if p == nil {
+		return errors.New("xray process is not initialized")
+	}
+
+	protocol := string(inbound.Protocol)
+	switch protocol {
+	case "vmess", "vless", "trojan", "shadowsocks":
+	default:
+		return fmt.Errorf("protocol %s is not supported for session cycling", protocol)
+	}
+
+	clientConfig := map[string]any{
+		"email":    client.Email,
+		"id":       client.ID,
+		"auth":     client.Auth,
+		"security": client.Security,
+		"flow":     client.Flow,
+		"password": client.Password,
+	}
+
+	if protocol == "shadowsocks" {
+		var inboundSettings map[string]any
+		if err := json.Unmarshal([]byte(inbound.Settings), &inboundSettings); err == nil {
+			if method, ok := inboundSettings["method"].(string); ok && method != "" {
+				clientConfig["cipher"] = method
+			}
+		}
+	}
+
+	s.xrayApi.Init(p.GetAPIPort())
+	defer s.xrayApi.Close()
+
+	if err := s.xrayApi.RemoveUser(inbound.Tag, client.Email); err != nil {
+		return err
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	return s.xrayApi.AddUser(protocol, inbound.Tag, clientConfig)
 }
