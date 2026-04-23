@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
@@ -272,7 +273,7 @@ func (j *CheckClientIpJob) enforceLimits(limitedClients map[string]limitedClient
 		return
 	}
 
-	if err := os.MkdirAll("/var/log/x-ui", 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(ipLimitLogPath), 0o755); err != nil {
 		logger.Warning("[LIMIT_IP] Failed to create log directory:", err)
 		return
 	}
@@ -318,5 +319,5 @@ func (j *CheckClientIpJob) checkFail2BanInstalled() bool {
 }
 
 func (j *CheckClientIpJob) resolveAccessLogPath() string {
-	return config.GetBinFolderPath() + "/access.log"
+	return filepath.Join(config.GetBinFolderPath(), "access.log")
 }
