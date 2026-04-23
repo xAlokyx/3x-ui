@@ -20,6 +20,8 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/web/service"
 )
 
+// Matches access-log lines containing:
+// <space-or-tab><ipv4>:<port> tcp:<email-or-user>
 var clientIPRegex = regexp.MustCompile(`[ \t](\d+\.\d+\.\d+\.\d+):\d+ tcp:(\S+)`)
 
 const ipLimitLogPath = "/var/log/x-ui/3xipl.log"
@@ -316,8 +318,5 @@ func (j *CheckClientIpJob) checkFail2BanInstalled() bool {
 }
 
 func (j *CheckClientIpJob) resolveAccessLogPath() string {
-	if path, err := os.Stat(config.GetBinFolderPath() + "/access.log"); err == nil && !path.IsDir() {
-		return config.GetBinFolderPath() + "/access.log"
-	}
 	return config.GetBinFolderPath() + "/access.log"
 }
